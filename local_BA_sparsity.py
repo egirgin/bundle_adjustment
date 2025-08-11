@@ -13,6 +13,7 @@ class MapPoint:
     id: int
     position: np.ndarray  # 3x1 vector
     observations: list  # List of (keyframe_id, keypoint_index)
+    color: np.ndarray  # 3x1 vector
 
 @dataclass
 class Keyframe:
@@ -63,6 +64,7 @@ class Map:
         
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(np.squeeze(positions))
+        pcd.colors = o3d.utility.Vector3dVector([p.color for p in self.map_points.values()])
         return pcd
 
 class BundleAdjuster:
@@ -527,7 +529,7 @@ class VisualOdometryPipeline:
                         last_kf_kp_idx = matches[match_idx].queryIdx
                         new_kf_kp_idx = matches[match_idx].trainIdx
 
-                        mp = MapPoint(id=self.map.next_map_point_id, position=points_3d_world[:, i].reshape(3,1), observations=[])
+                        mp = MapPoint(id=self.map.next_map_point_id, position=points_3d_world[:, i].reshape(3,1), observations=[], color=frame[int(new_pts2[i][1]), int(new_pts2[i][0])])
                         mp.observations.append((last_kf.id, last_kf_kp_idx))
                         mp.observations.append((new_kf.id, new_kf_kp_idx))
                         
@@ -614,7 +616,7 @@ def main():
         if not ret:
             break
 
-        if 90 <= frame_idx < 1400: # 90 -> 1400
+        if 90 <= frame_idx < 500: # 90 -> 1400
             print(f"Processing frame {frame_idx}...")
             #cv2.imshow("Current Frame", frame)
             #cv2.waitKey(1)
