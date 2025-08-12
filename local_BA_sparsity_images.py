@@ -1,14 +1,14 @@
 import sys
 import cv2
-import matplotlib
 import numpy as np
 import os
 import open3d as o3d
 from scipy.optimize import least_squares
 from dataclasses import dataclass
 from scipy.sparse import lil_matrix
-matplotlib.use('Agg') # Use the Agg backend
 import matplotlib.pyplot as plt
+#from mpl_toolkits.mplot3d import Axes3D
+
 
 @dataclass
 class MapPoint:
@@ -275,19 +275,6 @@ class BundleAdjuster:
             adjustable_kf_ids, local_map_point_ids, observations
         )
 
-        # --- DEBUG: Visualize Sparsity ---
-        # This saves a plot of the Jacobian's structure.
-        plt.figure(figsize=(8, 8))
-        plt.spy(sparsity_matrix, markersize=1)
-        plt.title(f"Jacobian Sparsity (LBA for KF {fixed_kf_id+1} to {local_kf_ids[-1]})")
-        plt.xlabel("Parameters (Camera Poses + 3D Points)")
-        plt.ylabel("Residuals (Observations)")
-        sparsity_debug_dir = "debug_sparsity"
-        os.makedirs(sparsity_debug_dir, exist_ok=True)
-        plt.savefig(os.path.join(sparsity_debug_dir, f"sparsity_{fixed_kf_id}.png"))
-        plt.close() # Close the plot to prevent it from displaying blocking the run
-        # --- END DEBUG BLOCK ---
-
         # 4. Run the optimization
         res = least_squares(
             self._cost_function,
@@ -300,16 +287,10 @@ class BundleAdjuster:
             ftol=1e-5,
             max_nfev=50
         )
-
-        final_cost = np.sum(res.fun**2)
-        # --- CRITICAL FIX: Add this check ---
-        if final_cost >= initial_cost:
-            print(f"    -> LBA Diverged! Cost increased from {initial_cost:.2f} to {final_cost:.2f}. Discarding optimization results.")
-            return # Exit the function without updating the map
-        # --- END FIX ---
         
         # 5. Update the map with the optimized parameters (ONLY for adjustable frames)
         optimized_params = res.x
+        final_cost = np.sum(res.fun**2)
         num_adjustable_keyframes = len(adjustable_kf_ids)
         
         opt_rvecs = optimized_params[0 : num_adjustable_keyframes * 3].reshape((num_adjustable_keyframes, 3))
@@ -327,8 +308,7 @@ class BundleAdjuster:
             gmap.map_points[mp_id].position = opt_points_3d[i].reshape(3, 1)
             
         print(f"    -> LBA Complete. Fixed KF {fixed_kf_id}. Optimized {num_adjustable_keyframes} KFs and {len(local_map_point_ids)} MPs.")
-        improvement = 100.0 * (initial_cost - final_cost) / (initial_cost + 1e-8)
-        print(f"    -> LBA Complete. Initial Cost: {initial_cost:.2f}, Final Cost: {final_cost:.2f}, Improvement: {improvement:.2f}%")
+        print(f"    -> LBA Complete. Initial Cost: {initial_cost:.2f}, Final Cost: {final_cost:.2f}")
 
 class FeatureExtractor:
     def extract(self, image):
@@ -353,12 +333,44 @@ class BruteForceMatcher(FeatureMatcher):
         if des1 is None or des2 is None:
             return []
         matches = self.matcher.knnMatch(des1, des2, k=2)
+
         good_matches = []
         try:
             for m, n in matches:
-                if m.distance < 0.5 * n.distance:
+                if m.distance < 0.60 * n.distance:
                     good_matches.append(m)
         except ValueError:
+            pass
+        return good_matches
+    
+class FLANNMatcher(FeatureMatcher):
+    def __init__(self):
+        # FLANN parameters for ORB (binary descriptors)
+        # LSH is the recommended algorithm for binary descriptors like ORB's
+        index_params = dict(algorithm=6,  # FLANN_INDEX_LSH
+                            table_number=12,
+                            key_size=20,
+                            multi_probe_level=2)
+        search_params = dict(checks=50)  # or search_params = {}
+        self.matcher = cv2.FlannBasedMatcher(index_params, search_params)
+
+    def match(self, des1, des2):
+        if des1 is None or des2 is None:
+            return []
+        
+        # DO NOT convert descriptors to float32. 
+        # ORB produces uint8 descriptors, and LSH requires them in that format.
+        
+        matches = self.matcher.knnMatch(des1, des2, k=2)
+        
+        # Apply Lowe's ratio test to find good matches
+        good_matches = []
+        try:
+            for m, n in matches:
+                if m.distance < 0.6 * n.distance:
+                    good_matches.append(m)
+        except ValueError:
+            # This can happen if k=2 finds fewer than 2 neighbors
             pass
         return good_matches
 
@@ -401,7 +413,7 @@ class VisualOdometryPipeline:
         self.feature_extractor = feature_extractor
         self.feature_matcher = feature_matcher
         self.keyframe_criteria = keyframe_criteria
-        self.min_matches_to_track = 20
+        self.min_matches_to_track = 1
 
         self.map = Map()
         self.bundle_adjuster = BundleAdjuster(camera_matrix, window_size=5)
@@ -414,6 +426,7 @@ class VisualOdometryPipeline:
 
     def _is_keyframe(self, relative_R, num_matches, inlier_pts1, inlier_pts2, last_kf_feature_count):
     
+        return True
         median_displacement = self._calculate_median_displacement(inlier_pts1, inlier_pts2)
         # higher values mean more dramatic change in the translation of matrix.
         if median_displacement > self.keyframe_criteria['min_pixel_displacement']:
@@ -454,7 +467,6 @@ class VisualOdometryPipeline:
         Returns:
             None
         """
-        debug = True  # Set to False to disable visualization
 
         gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         keypoints, descriptors = self.feature_extractor.extract(gray_frame)
@@ -480,9 +492,9 @@ class VisualOdometryPipeline:
         matches = self.feature_matcher.match(last_kf.descriptors, descriptors)
 
         # Visualize matched keypoints between last keyframe and current frame
-        
+        debug_matches = True  # Set to False to disable visualization
 
-        if debug:
+        if debug_matches:
             img_matches = cv2.drawMatches(
                 last_kf.img,  # Last keyframe's RGB image
                 last_kf.keypoints,
@@ -500,7 +512,7 @@ class VisualOdometryPipeline:
             # Optionally display the image:
             # cv2.imshow(f"Matched Keypoints (Frame {self.map.next_keyframe_id})", img_matches)
             # cv2.waitKey(1)
-
+        
         if len(matches) < self.min_matches_to_track:
             print("    -> Frame Discarded: Not enough matches to track.")
             return
@@ -511,17 +523,10 @@ class VisualOdometryPipeline:
             print("    -> Frame Discarded: Could not estimate pose.")
             return
         
-        # Calculate inlier ratio
-        num_inliers = len(inlier_indices)
-        num_matches = len(matches)
-        inlier_ratio = num_inliers / num_matches if num_matches > 0 else 0
-        is_reliable = inlier_ratio > 0.4 and num_inliers > 20
-
-        if not is_reliable:
-            print("    -> Frame Discarded: Low inlier ratio or insufficient inliers.")
-            return
-
-        if is_reliable and self._is_keyframe(relative_R, len(matches), inlier_pts1, inlier_pts2, len(last_kf.keypoints)):
+        if self._is_keyframe(relative_R, len(matches), inlier_pts1, inlier_pts2, len(last_kf.keypoints)):
+            
+            # Visualization and saving of detected keyframes
+            debug = True  # Set this to False to disable visualization and saving
 
             if debug:
                 img_with_keypoints = cv2.drawKeypoints(frame, keypoints, None, color=(0,255,0), flags=0)
@@ -610,23 +615,12 @@ class VisualOdometryPipeline:
         pts1 = np.float32([kp1[m.queryIdx].pt for m in matches])
         pts2 = np.float32([kp2[m.trainIdx].pt for m in matches])
         
-        E, mask = cv2.findEssentialMat(pts1, pts2, self.camera_matrix, method=cv2.RANSAC, prob=0.999, threshold=3.0)
+        E, mask = cv2.findEssentialMat(pts1, pts2, self.camera_matrix, method=cv2.RANSAC, prob=0.999, threshold=0.5)
         if E is None:
             return None, None, None, None, None
             
         _, R_rel, t_rel, mask = cv2.recoverPose(E, pts1, pts2, self.camera_matrix, mask=mask)
         
-        # --- DEBUG: Log Inlier Ratio ---
-        num_matches = len(matches)
-        num_inliers = np.sum(mask)
-        inlier_ratio = num_inliers / num_matches if num_matches > 0 else 0
-        print(f"    -> Pose Estimation: {num_inliers} inliers out of {num_matches} matches (Ratio: {inlier_ratio:.2f})")
-        # --- END DEBUG BLOCK ---
-
-        # A very low ratio indicates a poor geometric match
-        if inlier_ratio < 0.2: # You can tune this threshold
-            print("    -> WARNING: Low inlier ratio. Pose estimate may be unreliable.")
-    
         # Get inlier points and their original indices from the matches list
         inlier_mask = mask.ravel() == 1
         inlier_indices = np.where(inlier_mask)[0]
@@ -648,63 +642,58 @@ class VisualOdometryPipeline:
         points_4d_hom = cv2.triangulatePoints(P1, P2, pts1.T, pts2.T)
         points_3d = points_4d_hom / (points_4d_hom[3] + 1e-6)
         
-        initial_count = points_4d_hom.shape[1]
         valid_mask = points_3d[2, :] > 0
         points_3d = points_3d[:3, valid_mask]
-
-        # --- DEBUG: Log Triangulation Results ---
-        final_count = points_3d.shape[1]
-        print(f"    -> Triangulation: Kept {final_count} of {initial_count} points (z > 0 filter).")
-        # --- END DEBUG BLOCK ---
         
         if points_3d.shape[1] == 0:
             return None, None
 
         return points_3d, np.where(valid_mask)[0]
+    
 
 def main():
-    video_path = '/home/students/girgine/ros2_ws/src/visual_odometry/data/srge_lab.avi'
+    image_folder = '/home/students/girgine/ros2_ws/src/visual_odometry/data/desk_images'
     output_dir = 'output_map'
     os.makedirs(output_dir, exist_ok=True)
     final_map_path = os.path.join(output_dir, "final_map_lba.pcd")
 
     KEYFRAME_CRITERIA = {
-        "min_pixel_displacement": 40.0, # higher more selective
-        "min_rotation": 0.15, # higher more selective
-        "min_feature_ratio": 0.25 # lower more selective
+        "min_pixel_displacement": 30.0,
+        "min_rotation": 1.0,
+        "min_feature_ratio": 0.2
     }
 
     camera_matrix = np.array([
-        [912.7820434570312, 0.0, 650.2929077148438],
-        [0.0, 913.0294189453125, 362.7241516113281],
+        [431.39865, 0.0, 429.08605],
+        [0.0, 431.39865, 235.27142],
         [0.0, 0.0, 1.0]
     ])
     dist_coeffs = np.array([0.0, 0.0, 0.0, 0.0, 0.0])
 
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        print(f"Error: Could not open video file at '{video_path}'")
+    # Get sorted list of image files
+    image_files = sorted([
+        os.path.join(image_folder, fname)
+        for fname in os.listdir(image_folder)
+        if fname.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))
+    ])
+
+    if not image_files:
+        print(f"Error: No image files found in '{image_folder}'")
         return
 
     print("Initializing visual odometry pipeline...")
     vo_pipeline = VisualOdometryPipeline(camera_matrix, dist_coeffs, ORBExtractor(n_features=4000), BruteForceMatcher(), KEYFRAME_CRITERIA)
-    print("Opening video...")
-    frame_idx = 0
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
+    print("Processing images...")
+    for frame_idx, img_path in enumerate(image_files):
+        frame = cv2.imread(img_path)
+        if frame is None:
+            print(f"Warning: Could not read image '{img_path}'")
+            continue
+        print(f"Processing frame {frame_idx} ({img_path})...")
+        vo_pipeline.process_frame(frame)
 
-        if 90 <= frame_idx < 1400: # 90 -> 1400
-            print(f"Processing frame {frame_idx}...")
-            #cv2.imshow("Current Frame", frame)
-            #cv2.waitKey(1)
-            vo_pipeline.process_frame(frame)
-        frame_idx += 1
+    print("\nImage sequence processing finished.")
 
-    print("\nVideo processing finished.")
-    
-    cap.release()
     cv2.destroyAllWindows()
 
     # --- INSERT THIS CODE FOR GLOBAL BA ---
@@ -728,7 +717,7 @@ def main():
     final_pcd = vo_pipeline.map.get_pcd()
     if final_pcd.has_points():
         print(f"\nSaving final map from {vo_pipeline.map.next_keyframe_id} keyframes to '{final_map_path}'...")
-        downsampled_pcd = final_pcd.voxel_down_sample(voxel_size=0.05)
+        downsampled_pcd = final_pcd.voxel_down_sample(voxel_size=0.1)
         o3d.io.write_point_cloud(final_map_path, downsampled_pcd)
         print("Map saved successfully.")
 
