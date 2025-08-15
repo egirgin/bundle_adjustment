@@ -130,7 +130,7 @@ class BundleAdjuster:
         args:
             gmap: The global map to optimize.
         """
-        print("--- Running Local Bundle Adjustment ---")
+        print("    --- Running Local Bundle Adjustment ---")
         
         all_kf_ids = sorted(gmap.keyframes.keys())
         if len(all_kf_ids) < self.window_size:
