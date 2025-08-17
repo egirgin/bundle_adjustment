@@ -19,7 +19,8 @@ def clean_directories(folders):
 
 def main():
     # --- Configuration ---
-    VIDEO_PATH = '/home/students/girgine/ros2_ws/src/visual_odometry/data/my_dataset_7/video_0001.mp4'
+    VIDEO_PATH = '../data/video_0001.mp4'
+    #VIDEO_PATH = '/home/students/girgine/ros2_ws/src/visual_odometry/data/my_dataset_7/video_0001.mp4'
     #VIDEO_PATH = '/home/students/girgine/ros2_ws/src/visual_odometry/data/desk.avi'
 
     # Keyframe selection criteria
