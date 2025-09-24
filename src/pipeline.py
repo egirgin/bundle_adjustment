@@ -95,6 +95,7 @@ class VisualOdometryPipeline:
                 cv2.imwrite(img_filename, img_with_keypoints)
                 
             self._add_new_keyframe(frame, keypoints, descriptors, last_kf, matches, relative_R, relative_t, inlier_indices, inlier_pts1, inlier_pts2)
+            #self._add_new_keyframe_exhaustive(frame, keypoints, descriptors, relative_R, relative_t)
             self.bundle_adjuster.run(self.map)
     
     def _initialize_map(self, frame, keypoints, descriptors):
@@ -107,6 +108,120 @@ class VisualOdometryPipeline:
             keypoints=keypoints, descriptors=descriptors, observations=[], img=frame.copy()
         )
         self.map.add_keyframe(kf)
+
+    def _add_new_keyframe_exhaustive(self, frame, keypoints, descriptors, R_rel, t_rel):
+        """
+        (Corrected Version)
+        Match the descriptors of the new keyframe against all existing keyframes in the map.
+        Then determine if matches corresponds to an existing map point or a new map point.
+        """
+        
+        # 1. PREDICT THE NEW KEYFRAME'S POSE
+        # ------------------------------------
+        
+        last_kf = self.map.keyframes[self.map.next_keyframe_id - 1]
+        
+        world_R = last_kf.R @ R_rel
+        world_t = last_kf.t + last_kf.R @ t_rel
+        new_kf = Keyframe(id=self.map.next_keyframe_id, R=world_R, t=world_t, keypoints=keypoints, descriptors=descriptors, observations=[], img=frame.copy())
+        
+
+        # 2. MATCH AGAINST ALL PREVIOUS KEYFRAMES
+        # -----------------------------------------
+        # Note: This is computationally expensive. A better approach is to match only 
+        # against a smaller set of "covisible" keyframes.
+        for kf_id, kf in self.map.keyframes.items():
+            matches = self.feature_matcher.match(kf.descriptors, descriptors)
+
+            if len(matches) < 8: # Not enough matches to be reliable
+                continue
+
+            pts1: np.ndarray = np.float32([kf.keypoints[m.queryIdx].pt for m in matches])
+            pts2: np.ndarray = np.float32([new_kf.keypoints[m.trainIdx].pt for m in matches])
+
+            ## FIX 3: Use findEssentialMat to get inliers and the Essential matrix
+            E, mask = cv2.findEssentialMat(pts1, pts2, self.camera_matrix, method=cv2.RANSAC, prob=0.999, threshold=3.0)
+
+            if E is None or mask is None:
+                continue
+                
+            # Decompose E to get the relative pose. This gives the rotation and translation direction
+            # from kf -> new_kf. This pose will be used for triangulating *new* points.
+            _, R_rel, t_rel, _ = cv2.recoverPose(E, pts1, pts2, self.camera_matrix, mask=mask)
+
+            inlier_mask: np.ndarray = mask.ravel() == 1
+            inlier_indices = np.where(inlier_mask)[0]
+            
+            kf_obs_lookup = {kp_idx: mp_id for mp_id, kp_idx in kf.observations}
+            
+            newly_triangulated_pts1 = []
+            newly_triangulated_pts2 = []
+            newly_triangulated_indices = []
+
+            for match_idx in inlier_indices:
+                kf_kp_idx = matches[match_idx].queryIdx
+                new_kf_kp_idx = matches[match_idx].trainIdx
+
+                if kf_kp_idx in kf_obs_lookup:
+                    # Re-observation of an existing map point
+                    mp_id = kf_obs_lookup[kf_kp_idx]
+                    
+                    # Check for conflicts: if the new keypoint is already observing a DIFFERENT map point
+                    is_already_observed = any(obs[1] == new_kf_kp_idx for obs in self.map.map_points[mp_id].observations)
+                    if not is_already_observed:
+                        self.map.map_points[mp_id].observations.append((new_kf.id, new_kf_kp_idx))
+                        new_kf.observations.append((mp_id, new_kf_kp_idx))
+                else:
+                    # New 3D point to be triangulated
+                    newly_triangulated_pts1.append(pts1[match_idx])
+                    newly_triangulated_pts2.append(pts2[match_idx])
+                    newly_triangulated_indices.append(match_idx)
+
+            ## FIX 4: Triangulation must happen INSIDE the loop for each keyframe pair
+            if newly_triangulated_pts1:
+                new_pts1 = np.array(newly_triangulated_pts1)
+                new_pts2 = np.array(newly_triangulated_pts2)
+                
+                # Triangulate points. `points_3d_relative` are in kf's camera coordinate system.
+                points_3d_relative, _ = self._triangulate_points(R_rel, t_rel, new_pts1, new_pts2)
+                
+                if points_3d_relative is not None:
+                    # Create the 4x4 camera-to-world pose matrix for the reference keyframe `kf`
+                    T_cw_kf = np.eye(4)
+                    T_cw_kf[:3, :3] = kf.R
+                    T_cw_kf[:3, 3] = kf.t.flatten()
+                    T_wc_kf = np.linalg.inv(T_cw_kf)
+
+                    # Convert triangulated points to homogeneous coordinates
+                    points_4d_relative = np.vstack((points_3d_relative, np.ones((1, points_3d_relative.shape[1]))))
+                    
+                    ## FIX 5: Use proper matrix transformation to get world coordinates
+                    points_4d_world = T_wc_kf @ points_4d_relative
+                    points_3d_world = points_4d_world[:3, :] / points_4d_world[3, :]
+
+                    for i in range(points_3d_world.shape[1]):
+                        match_idx = newly_triangulated_indices[i]
+                        kf_kp_idx = matches[match_idx].queryIdx
+                        new_kf_kp_idx = matches[match_idx].trainIdx
+
+                        bgr_color = frame[int(new_pts2[i][1]), int(new_pts2[i][0])]
+                        rgb_color = (bgr_color[::-1] / 255.0).astype(np.float64)
+
+                        mp = MapPoint(id=self.map.next_map_point_id, 
+                                    position=points_3d_world[:, i].reshape(3,1), 
+                                    observations=[], 
+                                    color=rgb_color)
+                        mp.observations.extend([(kf.id, kf_kp_idx), (new_kf.id, new_kf_kp_idx)])
+                        kf.observations.append((mp.id, kf_kp_idx))
+                        new_kf.observations.append((mp.id, new_kf_kp_idx))
+                        self.map.add_map_point(mp)
+
+        # Add the new keyframe to the map
+        self.map.add_keyframe(new_kf) # Use the add_keyframe method to ensure ID increments
+
+        plot_and_save_trajectory_2d(self.map, self.trajectory_output_dir_2d)
+        plot_and_save_trajectory_3d(self.map, self.trajectory_output_dir_3d)
+
 
     def _add_new_keyframe(self, frame, keypoints, descriptors, last_kf, matches, R_rel, t_rel, inlier_indices, inlier_pts1, inlier_pts2):
         """

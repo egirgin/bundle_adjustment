@@ -1,1 +1,3 @@
 src/*/
+colmap_test.py
+colmap_output/
